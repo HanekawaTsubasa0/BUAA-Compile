@@ -356,7 +356,8 @@ public class LlvmToMipsGenerator {
             }
         }
 
-        for (String raw : f.body) {
+        for (int idx = 0; idx < f.body.size(); idx++) {
+            String raw = f.body.get(idx);
             String line = raw.trim();
             if (line.isEmpty() || line.equals("}")) continue;
             if (line.startsWith(";")) continue;
@@ -364,6 +365,18 @@ public class LlvmToMipsGenerator {
                 String label = line.substring(0, line.length() - 1);
                 sb.append(fname).append("_").append(label).append(":\n");
                 continue;
+            }
+            // peephole: icmp followed by zext or branch consuming it
+            if (line.contains(" = icmp") && idx + 1 < f.body.size()) {
+                String next = f.body.get(idx + 1).trim();
+                if (next.contains(" = zext") && tryEmitIcmpZextCombo(f, line, next, sb)) {
+                    idx++; // consume next as well
+                    continue;
+                }
+                if (next.startsWith("br i1") && tryEmitIcmpBranchCombo(f, line, next, sb)) {
+                    idx++; // consume next as well
+                    continue;
+                }
             }
             if (line.startsWith("store")) {
                 emitStore(f, line, sb);
@@ -379,6 +392,10 @@ public class LlvmToMipsGenerator {
                 emitDivRem(f, line, sb, true);
             } else if (line.contains(" = srem")) {
                 emitDivRem(f, line, sb, false);
+            } else if (line.contains(" = and")) {
+                emitAndOr(f, line, sb, true);
+            } else if (line.contains(" = or")) {
+                emitAndOr(f, line, sb, false);
             } else if (line.contains(" = icmp")) {
                 emitIcmp(f, line, sb);
             } else if (line.contains(" = zext")) {
@@ -467,6 +484,15 @@ public class LlvmToMipsGenerator {
 
         sb.append("  # ").append(line.trim()).append("\n");
         loadOperand(f, op1, "$t0", sb);
+        if (op.contains("add") || op.contains("sub")) {
+            Integer imm = tryParseImm(op2);
+            if (imm != null && imm >= -32768 && imm <= 32767) {
+                int val = op.contains("sub") ? -imm : imm;
+                sb.append("  addiu $t2, $t0, ").append(val).append("\n");
+                storeValue(f, dest, "$t2", sb);
+                return;
+            }
+        }
         loadOperand(f, op2, "$t1", sb);
         sb.append("  ").append(op).append(" $t2, $t0, $t1\n");
         storeValue(f, dest, "$t2", sb);
@@ -483,6 +509,22 @@ public class LlvmToMipsGenerator {
 
         sb.append("  # ").append(line.trim()).append("\n");
         loadOperand(f, op1, "$t0", sb);
+        Integer imm = tryParseImm(op2);
+        if (imm != null) {
+            if (imm == 0) {
+                sb.append("  move $t2, $zero\n");
+                storeValue(f, dest, "$t2", sb);
+                return;
+            } else if (imm == 1) {
+                sb.append("  move $t2, $t0\n");
+                storeValue(f, dest, "$t2", sb);
+                return;
+            } else if (imm == -1) {
+                sb.append("  subu $t2, $zero, $t0\n");
+                storeValue(f, dest, "$t2", sb);
+                return;
+            }
+        }
         loadOperand(f, op2, "$t1", sb);
         sb.append("  mul $t2, $t0, $t1\n");
         storeValue(f, dest, "$t2", sb);
@@ -499,6 +541,22 @@ public class LlvmToMipsGenerator {
 
         sb.append("  # ").append(line.trim()).append("\n");
         loadOperand(f, op1, "$t0", sb);
+        Integer imm = tryParseImm(op2);
+        if (imm != null) {
+            if (imm == 1) {
+                sb.append("  move $t2, $t0\n");
+                storeValue(f, dest, "$t2", sb);
+                return;
+            } else if (imm == -1) {
+                if (isDiv) {
+                    sb.append("  subu $t2, $zero, $t0\n");
+                } else {
+                    sb.append("  move $t2, $zero\n");
+                }
+                storeValue(f, dest, "$t2", sb);
+                return;
+            }
+        }
         loadOperand(f, op2, "$t1", sb);
         sb.append("  div $t0, $t1\n");
         sb.append(isDiv ? "  mflo $t2\n" : "  mfhi $t2\n");
@@ -515,6 +573,87 @@ public class LlvmToMipsGenerator {
         String rhs = m.group(3).trim();
 
         sb.append("  # ").append(line.trim()).append("\n");
+        String lhsTok = lhs.substring(lhs.indexOf(' ') + 1).trim();
+        String rhsTok = rhs.substring(rhs.indexOf(' ') + 1).trim();
+        Integer imm = tryParseImm(rhsTok);
+        if (imm != null && imm >= -32768 && imm <= 32767) {
+            loadOperand(f, lhsTok, "$t0", sb);
+            switch (cond) {
+                case "slt":
+                    sb.append("  slti $t2, $t0, ").append(imm).append("\n");
+                    break;
+                case "sle":
+                    sb.append("  slti $t2, $t0, ").append(imm + 1).append("\n");
+                    break;
+                case "sge":
+                    sb.append("  slti $t2, $t0, ").append(imm).append("\n");
+                    sb.append("  xori $t2, $t2, 1\n");
+                    break;
+                case "sgt":
+                    sb.append("  slti $t2, $t0, ").append(imm + 1).append("\n");
+                    sb.append("  xori $t2, $t2, 1\n");
+                    break;
+                case "eq":
+                    sb.append("  xori $t2, $t0, ").append(imm).append("\n");
+                    sb.append("  sltiu $t2, $t2, 1\n");
+                    break;
+                case "ne":
+                    sb.append("  xori $t2, $t0, ").append(imm).append("\n");
+                    sb.append("  sltu $t2, $zero, $t2\n");
+                    break;
+                default:
+                    loadOperand(f, rhsTok, "$t1", sb);
+                    sb.append("  slt $t2, $t0, $t1\n");
+            }
+        } else {
+            loadOperand(f, lhsTok, "$t0", sb);
+            loadOperand(f, rhsTok, "$t1", sb);
+            switch (cond) {
+                case "slt":
+                    sb.append("  slt $t2, $t0, $t1\n");
+                    break;
+                case "sgt":
+                    sb.append("  slt $t2, $t1, $t0\n");
+                    break;
+                case "sle":
+                    sb.append("  slt $t2, $t1, $t0\n");
+                    sb.append("  xori $t2, $t2, 1\n");
+                    break;
+                case "sge":
+                    sb.append("  slt $t2, $t0, $t1\n");
+                    sb.append("  xori $t2, $t2, 1\n");
+                    break;
+                case "eq":
+                    sb.append("  xor $t2, $t0, $t1\n");
+                    sb.append("  sltiu $t2, $t2, 1\n");
+                    break;
+                case "ne":
+                    sb.append("  xor $t2, $t0, $t1\n");
+                    sb.append("  sltu $t2, $zero, $t2\n");
+                    break;
+                default:
+                    sb.append("  li $t2, 0\n");
+            }
+        }
+        f.valWidth.put(dest, 1);
+        storeValue(f, dest, "$t2", sb, 1);
+    }
+
+    private boolean tryEmitIcmpZextCombo(Func f, String icmpLine, String zextLine, StringBuilder sb) {
+        String icmpDest = icmpLine.substring(0, icmpLine.indexOf('=')).trim();
+        Matcher mZext = Pattern.compile("zext\\s+i1\\s+%([\\w\\.]+)\\s+to\\s+i\\d+").matcher(zextLine);
+        if (!mZext.find()) return false;
+        String src = "%" + mZext.group(1);
+        if (!icmpDest.equals(src)) return false;
+        if (isUsedLater(f.body, icmpDest, zextLine)) return false;
+        Matcher mIcmp = Pattern.compile("icmp\\s+(\\w+)\\s+i\\d+\\s+([^,]+),\\s+(.+)$").matcher(icmpLine);
+        if (!mIcmp.find()) return false;
+        String cond = mIcmp.group(1);
+        String lhs = mIcmp.group(2).trim();
+        String rhs = mIcmp.group(3).trim();
+        String zextDest = zextLine.substring(0, zextLine.indexOf('=')).trim();
+
+        sb.append("  # ").append(icmpLine.trim()).append(" ; ").append(zextLine.trim()).append("\n");
         loadOperand(f, lhs.substring(lhs.indexOf(' ') + 1).trim(), "$t0", sb);
         loadOperand(f, rhs.substring(rhs.indexOf(' ') + 1).trim(), "$t1", sb);
         switch (cond) {
@@ -541,10 +680,80 @@ public class LlvmToMipsGenerator {
                 sb.append("  sltu $t2, $zero, $t2\n");
                 break;
             default:
-                sb.append("  li $t2, 0\n");
+                return false;
         }
-        f.valWidth.put(dest, 1);
-        storeValue(f, dest, "$t2", sb, 1);
+        f.valWidth.put(zextDest, 4);
+        storeValue(f, zextDest, "$t2", sb, 4);
+        return true;
+    }
+
+    private boolean tryEmitIcmpBranchCombo(Func f, String icmpLine, String brLine, StringBuilder sb) {
+        String dest = icmpLine.substring(0, icmpLine.indexOf('=')).trim();
+        // ensure dest not used later
+        if (isUsedLater(f.body, dest, brLine)) return false;
+        Matcher mIcmp = Pattern.compile("icmp\\s+(\\w+)\\s+i\\d+\\s+([^,]+),\\s+(.+)$").matcher(icmpLine);
+        Matcher mBr = Pattern.compile("br\\s+i1\\s+%([\\w\\.]+),\\s+label\\s+%([^,]+),\\s+label\\s+%(.+)$").matcher(brLine);
+        if (!mIcmp.find() || !mBr.find()) return false;
+        if (!dest.equals(mBr.group(1).trim())) return false;
+        String cond = mIcmp.group(1);
+        String lhs = mIcmp.group(2).trim();
+        String rhs = mIcmp.group(3).trim();
+        String tLabel = mBr.group(2).trim();
+        String fLabel = mBr.group(3).trim();
+        sb.append("  # ").append(icmpLine.trim()).append(" ; ").append(brLine.trim()).append("\n");
+        loadOperand(f, lhs.substring(lhs.indexOf(' ') + 1).trim(), "$t0", sb);
+        loadOperand(f, rhs.substring(rhs.indexOf(' ') + 1).trim(), "$t1", sb);
+        switch (cond) {
+            case "slt":
+                sb.append("  slt $t2, $t0, $t1\n");
+                sb.append("  beq $t2, $zero, ").append(labelOf(f, fLabel)).append("\n");
+                sb.append("  j ").append(labelOf(f, tLabel)).append("\n");
+                break;
+            case "sgt":
+                sb.append("  slt $t2, $t1, $t0\n");
+                sb.append("  beq $t2, $zero, ").append(labelOf(f, fLabel)).append("\n");
+                sb.append("  j ").append(labelOf(f, tLabel)).append("\n");
+                break;
+            case "sle":
+                sb.append("  slt $t2, $t1, $t0\n");
+                sb.append("  bne $t2, $zero, ").append(labelOf(f, tLabel)).append("\n");
+                sb.append("  j ").append(labelOf(f, fLabel)).append("\n");
+                break;
+            case "sge":
+                sb.append("  slt $t2, $t0, $t1\n");
+                sb.append("  bne $t2, $zero, ").append(labelOf(f, fLabel)).append("\n");
+                sb.append("  j ").append(labelOf(f, tLabel)).append("\n");
+                break;
+            case "eq":
+                sb.append("  xor $t2, $t0, $t1\n");
+                sb.append("  bne $t2, $zero, ").append(labelOf(f, fLabel)).append("\n");
+                sb.append("  j ").append(labelOf(f, tLabel)).append("\n");
+                break;
+            case "ne":
+                sb.append("  xor $t2, $t0, $t1\n");
+                sb.append("  beq $t2, $zero, ").append(labelOf(f, fLabel)).append("\n");
+                sb.append("  j ").append(labelOf(f, tLabel)).append("\n");
+                break;
+            default:
+                return false;
+        }
+        return true;
+    }
+
+    private boolean isUsedLater(List<String> body, String dest, String fromLine) {
+        boolean foundFrom = false;
+        String token = "%" + dest.replace("%", "");
+        for (String raw : body) {
+            String line = raw.trim();
+            if (!foundFrom) {
+                if (line.equals(fromLine.trim())) foundFrom = true;
+                continue;
+            }
+            if (line.contains(token)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private void emitZext(Func f, String line, StringBuilder sb) {
@@ -559,6 +768,17 @@ public class LlvmToMipsGenerator {
         storeValue(f, dest, "$t0", sb, 4);
     }
 
+    private Integer tryParseImm(String tok) {
+        tok = tok.trim();
+        int comma = tok.indexOf(',');
+        if (comma >= 0) tok = tok.substring(0, comma).trim();
+        try {
+            return Integer.parseInt(tok);
+        } catch (NumberFormatException e) {
+            return null;
+        }
+    }
+
     private void emitXor(Func f, String line, StringBuilder sb) {
         // %d = xor i1 %a, true/false/%b
         String dest = line.substring(0, line.indexOf('=')).trim();
@@ -567,10 +787,57 @@ public class LlvmToMipsGenerator {
         String op1 = m.group(1).trim();
         String op2 = m.group(2).trim();
         sb.append("  # ").append(line.trim()).append("\n");
+        // prefer immediate form when possible
+        Integer imm = tryParseImm(op2);
+        if (imm == null) {
+            imm = tryParseImm(op1);
+            if (imm != null) {
+                // swap so that op1 is register
+                String tmp = op1;
+                op1 = op2;
+                op2 = tmp;
+            }
+        }
+        if (imm != null && imm >= 0 && imm <= 0xFFFF) {
+            loadOperand(f, op1, "$t0", sb);
+            sb.append("  xori $t2, $t0, ").append(imm).append("\n");
+        } else {
+            loadOperand(f, op1, "$t0", sb);
+            loadOperand(f, op2, "$t1", sb);
+            sb.append("  xor $t2, $t0, $t1\n");
+        }
+        int w = line.contains("xor i1") ? 1 : 4;
+        f.valWidth.put(dest, w);
+        storeValue(f, dest, "$t2", sb, w);
+    }
+
+    private void emitAndOr(Func f, String line, StringBuilder sb, boolean isAnd) {
+        String dest = line.substring(0, line.indexOf('=')).trim();
+        Matcher m = Pattern.compile("(and|or)\\s+i\\d+\\s+([^,]+),\\s+(.+)$").matcher(line);
+        if (!m.find()) return;
+        String op1 = m.group(2).trim();
+        String op2 = m.group(3).trim();
+        sb.append("  # ").append(line.trim()).append("\n");
+        Integer imm = tryParseImm(op2);
+        boolean swap = false;
+        if (imm == null) {
+            imm = tryParseImm(op1);
+            if (imm != null) {
+                swap = true;
+                String tmp = op1; op1 = op2; op2 = tmp;
+            }
+        }
+        int w = line.contains("and i1") || line.contains("or i1") ? 1 : 4;
+        if (imm != null && imm >= 0 && imm <= 0xFFFF) {
+            loadOperand(f, op1, "$t0", sb);
+            sb.append(isAnd ? "  andi $t2, $t0, " : "  ori $t2, $t0, ").append(imm).append("\n");
+            f.valWidth.put(dest, w);
+            storeValue(f, dest, "$t2", sb, w);
+            return;
+        }
         loadOperand(f, op1, "$t0", sb);
         loadOperand(f, op2, "$t1", sb);
-        sb.append("  xor $t2, $t0, $t1\n");
-        int w = line.contains("xor i1") ? 1 : 4;
+        sb.append(isAnd ? "  and $t2, $t0, $t1\n" : "  or $t2, $t0, $t1\n");
         f.valWidth.put(dest, w);
         storeValue(f, dest, "$t2", sb, w);
     }
@@ -640,6 +907,17 @@ public class LlvmToMipsGenerator {
             String tLabel = m.group(2).trim();
             String fLabel = m.group(3).trim();
             sb.append("  # ").append(line.trim()).append("\n");
+            Integer imm = tryParseImm(cond);
+            if (imm != null) {
+                String target = imm != 0 ? tLabel : fLabel;
+                sb.append("  j ").append(labelOf(f, target)).append("\n");
+                return;
+            }
+            if ("true".equals(cond) || "false".equals(cond)) {
+                String target = "true".equals(cond) ? tLabel : fLabel;
+                sb.append("  j ").append(labelOf(f, target)).append("\n");
+                return;
+            }
             loadOperand(f, cond, "$t0", sb);
             sb.append("  beq $t0, $zero, ").append(labelOf(f, fLabel)).append("\n");
             sb.append("  j ").append(labelOf(f, tLabel)).append("\n");
@@ -697,15 +975,12 @@ public class LlvmToMipsGenerator {
                 sb.append("  li $v0, 5\n  syscall\n");
                 break;
             case "putint":
-                sb.append("  move $a0, $a0\n"); // already in $a0
                 sb.append("  li $v0, 1\n  syscall\n");
                 break;
             case "putch":
-                sb.append("  move $a0, $a0\n");
                 sb.append("  li $v0, 11\n  syscall\n");
                 break;
             case "putstr":
-                sb.append("  move $a0, $a0\n");
                 sb.append("  li $v0, 4\n  syscall\n");
                 break;
             default:
