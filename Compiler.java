@@ -3,6 +3,9 @@ import frontend.Lexer;
 import frontend.Parser;
 import backend.CodeGenerator;
 import backend.LlvmIRGenerator;
+import backend.ir.IrModule;
+import opt.llvm.LlvmOptimizer;
+import opt.mips.MipsOptimizer;
 import semantic.SemanticAnalyzer;
 
 import java.io.FileInputStream;
@@ -18,6 +21,9 @@ public class Compiler {
         System.setIn(new FileInputStream("testfile.txt"));
         System.setOut(new PrintStream(new FileOutputStream("parser.txt")));
         System.setErr(new PrintStream(new FileOutputStream("error.txt")));
+
+        // 手动开关优化：true 开启优化，false 保持原始输出
+        boolean enableOpt = true;
 
         Error error = Error.getInstance();
 
@@ -41,12 +47,19 @@ public class Compiler {
             // 原 AST->MIPS 暂停，使用 LLVM 再翻译 MIPS 供调试
             Files.write(Paths.get("symbol.txt"), semanticAnalyzer.dumpSymbols());
             LlvmIRGenerator llvm = new LlvmIRGenerator();
-            String ir = llvm.generate(parser.getCompUnitNode());
+            IrModule irModule = llvm.generateModule(parser.getCompUnitNode());
+            if (enableOpt) {
+                irModule = new LlvmOptimizer().optimize(irModule);
+            }
+            String ir = irModule.emit();
             Files.writeString(Paths.get("llvm_ir.txt"), ir);
             // LLVM -> MIPS
             backend.LlvmToMipsGenerator llvm2mips = new backend.LlvmToMipsGenerator();
-            String mipsFromIr = llvm2mips.generateFromFile("llvm_ir.txt");
-            Files.writeString(Paths.get("mips.txt"), mipsFromIr);
+            String mipsOutput = llvm2mips.generateFromModule(irModule);
+            if (enableOpt) {
+                mipsOutput = new MipsOptimizer().optimize(mipsOutput);
+            }
+            Files.writeString(Paths.get("mips.txt"), mipsOutput);
         }
     }
 }

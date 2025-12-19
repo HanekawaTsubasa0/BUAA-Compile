@@ -49,6 +49,37 @@ public class LlvmToMipsGenerator {
         return sb.toString();
     }
 
+    // New: generate directly from structured IR module (no file parsing)
+    public String generateFromModule(backend.ir.IrModule module) {
+        ParseResult pr = new ParseResult();
+        // data segment: globals and string literals as already formatted
+        for (String g : module.getGlobalDefs()) {
+            pr.dataItems.add(parseData(g));
+        }
+        for (String s : module.getStringDefs()) {
+            pr.dataItems.add(parseData(s));
+        }
+
+        for (backend.ir.IrFunction fn : module.getFunctions()) {
+            Func f = new Func();
+            parseFuncHeader(fn.getHeader(), f);
+            for (backend.ir.IrBasicBlock bb : fn.getBlocks()) {
+                f.body.add(bb.getLabel() + ":");
+                for (backend.ir.IrInstruction ins : bb.getInstructions()) {
+                    f.body.add(ins.getText());
+                }
+            }
+            f.body.add("}");
+            pr.funcs.add(f);
+        }
+        pr.funcs.forEach(this::planFrame);
+
+        StringBuilder sb = new StringBuilder();
+        emitData(pr.dataItems, sb);
+        emitText(pr.funcs, sb);
+        return sb.toString();
+    }
+
     /* ------------ parsing ------------ */
     private static class ParseResult {
         List<DataItem> dataItems = new ArrayList<>();

@@ -2,6 +2,7 @@ package backend;
 
 import ASTNode.*;
 import Token.TokenType;
+import backend.ir.*;
 import semantic.SymbolType;
 
 import java.nio.charset.StandardCharsets;
@@ -72,7 +73,9 @@ public class LlvmIRGenerator {
     }
 
     /* ---------- state ---------- */
-    private final StringBuilder funcsSb = new StringBuilder();
+    private IrModule module;
+    private IrFunction curFunction;
+    private IrBasicBlock curBlock;
     private final Map<String, String> stringLiterals = new LinkedHashMap<>();
     private final Map<String, String> strContentMap = new HashMap<>();
     private final Map<String, GlobalVar> globals = new LinkedHashMap<>();
@@ -87,21 +90,26 @@ public class LlvmIRGenerator {
     private int strId = 0;
 
     /* ---------- entry ---------- */
-    public String generate(CompUnitNode cu) {
+    public IrModule generateModule(CompUnitNode cu) {
         resetState();
+        module = new IrModule();
         collectGlobals(cu);
         collectFuncSigs(cu);
         emitFunctions(cu);
-        StringBuilder out = new StringBuilder();
-        emitPreamble(out);
-        emitGlobalDefs(out);
-        emitStringConsts(out);
-        out.append(funcsSb);
-        return out.toString();
+        emitPreamble();
+        emitGlobalDefs();
+        emitStringConsts();
+        return module;
+    }
+
+    public String generate(CompUnitNode cu) {
+        return generateModule(cu).emit();
     }
 
     private void resetState() {
-        funcsSb.setLength(0);
+        module = null;
+        curFunction = null;
+        curBlock = null;
         stringLiterals.clear();
         strContentMap.clear();
         globals.clear();
@@ -121,6 +129,15 @@ public class LlvmIRGenerator {
     private String freshLabel(String prefix) { return prefix + "_" + (labelId++); }
     private String newStaticLabel(String func, String name) { return "static_" + func + "_" + name + "_" + (labelId++); }
     private String irRet(SymbolType.BaseType t) { return t == SymbolType.BaseType.INT ? "i32" : "void"; }
+    private void setRegType(String name, String type) {
+        regType.put(name, type);
+        if (curFunction != null) {
+            IrValue v = curFunction.getValue(name);
+            if (v instanceof IrRegister) {
+                ((IrRegister) v).setType("i1".equals(type) ? IrType.intType(1) : IrType.intType(32));
+            }
+        }
+    }
 
     /* ---------- constant evaluation ---------- */
     private int evalConstExp(ConstExpNode node, Map<String, ConstInfo> env) {
@@ -302,37 +319,37 @@ public class LlvmIRGenerator {
     }
 
     /* ---------- module emission ---------- */
-    private void emitPreamble(StringBuilder out) {
-        out.append("; LLVM IR generated\n");
-        out.append("declare i32 @getint()\n");
-        out.append("declare void @putint(i32)\n");
-        out.append("declare void @putch(i32)\n");
-        out.append("declare void @putstr(i8*)\n\n");
+    private void emitPreamble() {
+        module.addDeclaration("; LLVM IR generated");
+        module.addDeclaration("declare i32 @getint()");
+        module.addDeclaration("declare void @putint(i32)");
+        module.addDeclaration("declare void @putch(i32)");
+        module.addDeclaration("declare void @putstr(i8*)");
     }
 
-    private void emitGlobalDefs(StringBuilder out) {
+    private void emitGlobalDefs() {
         for (GlobalVar gv : globals.values()) {
             if (!gv.isArray) {
-                out.append("@").append(gv.name)
-                        .append(" = dso_local ").append(gv.isConst ? "constant" : "global")
-                        .append(" i32 ").append(gv.inits.get(0)).append(", align 4\n");
+                module.addGlobalDef("@" + gv.name
+                        + " = dso_local " + (gv.isConst ? "constant" : "global")
+                        + " i32 " + gv.inits.get(0) + ", align 4");
             } else {
-                out.append("@").append(gv.name)
+                StringBuilder def = new StringBuilder();
+                def.append("@").append(gv.name)
                         .append(" = dso_local ").append(gv.isConst ? "constant" : "global")
                         .append(" [").append(gv.len).append(" x i32] [");
                 for (int i = 0; i < gv.len; i++) {
-                    if (i > 0) out.append(", ");
-                    out.append("i32 ").append(gv.inits.get(i));
+                    if (i > 0) def.append(", ");
+                    def.append("i32 ").append(gv.inits.get(i));
                 }
-                out.append("], align 4\n");
+                def.append("], align 4");
+                module.addGlobalDef(def.toString());
             }
         }
-        if (!globals.isEmpty()) out.append("\n");
     }
 
-    private void emitStringConsts(StringBuilder out) {
-        for (String def : stringLiterals.values()) out.append(def);
-        if (!stringLiterals.isEmpty()) out.append("\n");
+    private void emitStringConsts() {
+        for (String def : stringLiterals.values()) module.addStringDef(def.trim());
     }
 
     /* ---------- functions ---------- */
@@ -344,7 +361,6 @@ public class LlvmIRGenerator {
     private void emitFunction(FuncDefNode func) {
         String name = func.getIdent().getValue();
         FuncSig sig = funcSigs.get(name);
-        funcsSb.append("define dso_local ").append(irRet(sig.ret)).append(" @").append(name).append("(");
         List<String> params = new ArrayList<>();
         if (func.getFuncFParamsNode() != null) {
             int idx = 0;
@@ -360,7 +376,9 @@ public class LlvmIRGenerator {
                 idx++;
             }
         }
-        funcsSb.append(String.join(", ", params)).append(") {\n");
+        String header = "define dso_local " + irRet(sig.ret) + " @" + name + "(" + String.join(", ", params) + ") {";
+        curFunction = new IrFunction(name, header);
+        module.addFunction(curFunction);
 
         FuncContext ctx = new FuncContext();
         ctx.enterScope();
@@ -377,8 +395,8 @@ public class LlvmIRGenerator {
                 }
                 if (dims.isEmpty()) {
                     String alloca = freshReg();
-                    funcsSb.append("  ").append(alloca).append(" = alloca i32, align 4\n");
-                    funcsSb.append("  store i32 %arg").append(pIdx).append(", i32* ").append(alloca).append(", align 4\n");
+                    emit(IrInstruction.Opcode.ALLOCA, alloca, Collections.emptyList(), "  " + alloca + " = alloca i32, align 4");
+                    emit(IrInstruction.Opcode.STORE, Arrays.asList("%arg" + pIdx, alloca), "  store i32 %arg" + pIdx + ", i32* " + alloca + ", align 4");
                     VarInfo vi = new VarInfo();
                     vi.storage = Storage.PARAM;
                     vi.isArray = false;
@@ -388,8 +406,8 @@ public class LlvmIRGenerator {
                     ctx.defineVar(p.getIdent().getValue(), vi);
                 } else {
                     String alloca = freshReg();
-                    funcsSb.append("  ").append(alloca).append(" = alloca i32*, align 4\n");
-                    funcsSb.append("  store i32* %arg").append(pIdx).append(", i32** ").append(alloca).append(", align 4\n");
+                    emit(IrInstruction.Opcode.ALLOCA, alloca, Collections.emptyList(), "  " + alloca + " = alloca i32*, align 4");
+                    emit(IrInstruction.Opcode.STORE, Arrays.asList("%arg" + pIdx, alloca), "  store i32* %arg" + pIdx + ", i32** " + alloca + ", align 4");
                     VarInfo vi = new VarInfo();
                     vi.storage = Storage.PARAM;
                     vi.isArray = true;
@@ -405,31 +423,95 @@ public class LlvmIRGenerator {
         emitBlock(func.getBlockNode(), ctx, name);
 
         if (!ctx.terminated) {
-            if (sig.ret == SymbolType.BaseType.INT) funcsSb.append("  ret i32 0\n");
-            else funcsSb.append("  ret void\n");
+            if (sig.ret == SymbolType.BaseType.INT) emit(IrInstruction.Opcode.RET, null, Collections.singletonList("0"), "  ret i32 0");
+            else emit(IrInstruction.Opcode.RET, null, Collections.emptyList(), "  ret void");
         }
-        funcsSb.append("}\n\n");
+        buildCFG(curFunction);
+        curFunction = null;
+        curBlock = null;
         ctx.exitScope();
         constEnvStack.pop();
     }
 
     private void emitMain(MainFuncDefNode mainFunc) {
-        funcsSb.append("define dso_local i32 @main() {\n");
+        curFunction = new IrFunction("main", "define dso_local i32 @main() {");
+        module.addFunction(curFunction);
         FuncContext ctx = new FuncContext();
         ctx.enterScope();
         constEnvStack.push(new HashMap<>());
         startBlock("entry", ctx);
         emitBlock(mainFunc.getBlockNode(), ctx, "main");
-        if (!ctx.terminated) funcsSb.append("  ret i32 0\n");
-        funcsSb.append("}\n\n");
+        if (!ctx.terminated) emit(IrInstruction.Opcode.RET, null, Collections.singletonList("0"), "  ret i32 0");
+        buildCFG(curFunction);
+        curFunction = null;
+        curBlock = null;
         ctx.exitScope();
         constEnvStack.pop();
     }
 
     /* ---------- block & statements ---------- */
     private void startBlock(String label, FuncContext ctx) {
-        funcsSb.append(label).append(":\n");
+        curBlock = new IrBasicBlock(label);
+        curFunction.addBlock(curBlock);
         ctx.terminated = false;
+    }
+
+    private void emit(IrInstruction.Opcode opcode, String result, List<String> operandTokens, String line) {
+        if (curBlock == null) {
+            throw new IllegalStateException("emit called without active basic block");
+        }
+        IrRegister resVal = null;
+        if (result != null) {
+            resVal = createOrGetRegister(result);
+        }
+        List<IrValue> ops = buildOperands(operandTokens);
+        curBlock.addInstruction(new IrInstruction(opcode, resVal, ops, line));
+    }
+
+    private void emit(IrInstruction.Opcode opcode, List<String> operandTokens, String line) {
+        emit(opcode, null, operandTokens, line);
+    }
+
+    private IrRegister createOrGetRegister(String name) {
+        IrValue exist = curFunction.getValue(name);
+        if (exist instanceof IrRegister) {
+            return (IrRegister) exist;
+        }
+        String ty = regType.getOrDefault(name, "i32");
+        IrRegister reg = new IrRegister(name, "i1".equals(ty) ? IrType.intType(1) : IrType.intType(32));
+        curFunction.putValue(reg);
+        return reg;
+    }
+
+    private List<IrValue> buildOperands(List<String> tokens) {
+        List<IrValue> res = new ArrayList<>();
+        for (String tok : tokens) {
+            if (tok == null) continue;
+            res.add(valueFromToken(tok));
+        }
+        return res;
+    }
+
+    private IrValue valueFromToken(String tok) {
+        if (tok.startsWith("%")) {
+            IrValue v = curFunction.getValue(tok);
+            if (v == null) {
+                v = new IrRegister(tok, IrType.intType(32));
+                curFunction.putValue(v);
+            }
+            return v;
+        } else if (tok.startsWith("@")) {
+            return new IrGlobalRef(tok);
+        } else {
+            // label or constant
+            if (tok.matches("-?\\d+")) {
+                return new IrConstInt(Integer.parseInt(tok), 32);
+            }
+            if ("true".equals(tok) || "false".equals(tok)) {
+                return new IrConstInt("true".equals(tok) ? 1 : 0, 1);
+            }
+            return curFunction.getOrCreateLabel(tok);
+        }
     }
 
     private void emitBlock(BlockNode block, FuncContext ctx, String funcName) {
@@ -458,8 +540,8 @@ public class LlvmIRGenerator {
                 constEnvStack.peek().put(name, ci);
                 if (dims.isEmpty()) {
                     String alloca = freshReg();
-                    funcsSb.append("  ").append(alloca).append(" = alloca i32, align 4\n");
-                    funcsSb.append("  store i32 ").append(init.get(0)).append(", i32* ").append(alloca).append(", align 4\n");
+                    emit(IrInstruction.Opcode.ALLOCA, alloca, Collections.emptyList(), "  " + alloca + " = alloca i32, align 4");
+                    emit(IrInstruction.Opcode.STORE, Arrays.asList(String.valueOf(init.get(0)), alloca), "  store i32 " + init.get(0) + ", i32* " + alloca + ", align 4");
                     VarInfo vi = new VarInfo();
                     vi.storage = Storage.LOCAL;
                     vi.isArray = false;
@@ -469,10 +551,9 @@ public class LlvmIRGenerator {
                     ctx.defineVar(name, vi);
                 } else {
                     String alloca = freshReg();
-                    funcsSb.append("  ").append(alloca).append(" = alloca [").append(len).append(" x i32], align 4\n");
+                    emit(IrInstruction.Opcode.ALLOCA, alloca, Collections.emptyList(), "  " + alloca + " = alloca [" + len + " x i32], align 4");
                     String base = freshReg();
-                    funcsSb.append("  ").append(base).append(" = getelementptr inbounds [").append(len).append(" x i32], [")
-                            .append(len).append(" x i32]* ").append(alloca).append(", i32 0, i32 0\n");
+                    emit(IrInstruction.Opcode.GEP, base, Arrays.asList(alloca), "  " + base + " = getelementptr inbounds [" + len + " x i32], [" + len + " x i32]* " + alloca + ", i32 0, i32 0");
                     VarInfo vi = new VarInfo();
                     vi.storage = Storage.LOCAL;
                     vi.isArray = true;
@@ -482,9 +563,8 @@ public class LlvmIRGenerator {
                     ctx.defineVar(name, vi);
                     for (int i = 0; i < init.size(); i++) {
                         String elemPtr = freshReg();
-                        funcsSb.append("  ").append(elemPtr).append(" = getelementptr inbounds i32, i32* ").append(base)
-                                .append(", i32 ").append(i).append("\n");
-                        funcsSb.append("  store i32 ").append(init.get(i)).append(", i32* ").append(elemPtr).append(", align 4\n");
+                        emit(IrInstruction.Opcode.GEP, elemPtr, Arrays.asList(base), "  " + elemPtr + " = getelementptr inbounds i32, i32* " + base + ", i32 " + i);
+                        emit(IrInstruction.Opcode.STORE, Arrays.asList(String.valueOf(init.get(i)), elemPtr), "  store i32 " + init.get(i) + ", i32* " + elemPtr + ", align 4");
                     }
                 }
             }
@@ -503,50 +583,48 @@ public class LlvmIRGenerator {
                     globals.put(label, gv);
                     VarInfo vi = new VarInfo();
                     vi.storage = Storage.STATIC;
-                    vi.isArray = !dims.isEmpty();
-                    vi.ptr = null;
-                    vi.label = label;
-                    vi.dims = dims;
-                    vi.isStatic = true;
-                    ctx.defineVar(name, vi);
-                } else if (dims.isEmpty()) {
-                    String alloca = freshReg();
-                    funcsSb.append("  ").append(alloca).append(" = alloca i32, align 4\n");
-                    if (def.getInitValNode() != null) {
-                        String v = emitExp(def.getInitValNode().getExpNodes().get(0), ctx);
-                        funcsSb.append("  store i32 ").append(v).append(", i32* ").append(alloca).append(", align 4\n");
-                    }
-                    VarInfo vi = new VarInfo();
-                    vi.storage = Storage.LOCAL;
-                    vi.isArray = false;
-                    vi.ptr = alloca;
-                    vi.dims = Collections.emptyList();
-                    ctx.defineVar(name, vi);
-                } else {
-                    String alloca = freshReg();
-                    funcsSb.append("  ").append(alloca).append(" = alloca [").append(len).append(" x i32], align 4\n");
-                    String base = freshReg();
-                    funcsSb.append("  ").append(base).append(" = getelementptr inbounds [").append(len).append(" x i32], [")
-                            .append(len).append(" x i32]* ").append(alloca).append(", i32 0, i32 0\n");
-                    VarInfo vi = new VarInfo();
-                    vi.storage = Storage.LOCAL;
-                    vi.isArray = true;
-                    vi.ptr = base;
-                    vi.dims = dims;
-                    ctx.defineVar(name, vi);
-                    if (def.getInitValNode() != null) {
-                        List<ExpNode> exps = def.getInitValNode().getExpNodes();
-                        for (int i = 0; i < Math.min(exps.size(), len); i++) {
-                            String val = emitExp(exps.get(i), ctx);
-                            String elemPtr = freshReg();
-                            funcsSb.append("  ").append(elemPtr).append(" = getelementptr inbounds i32, i32* ").append(base)
-                                    .append(", i32 ").append(i).append("\n");
-                            funcsSb.append("  store i32 ").append(val).append(", i32* ").append(elemPtr).append(", align 4\n");
-                        }
+                vi.isArray = !dims.isEmpty();
+                vi.ptr = null;
+                vi.label = label;
+                vi.dims = dims;
+                vi.isStatic = true;
+                ctx.defineVar(name, vi);
+            } else if (dims.isEmpty()) {
+                String alloca = freshReg();
+                emit(IrInstruction.Opcode.ALLOCA, alloca, Collections.emptyList(), "  " + alloca + " = alloca i32, align 4");
+                if (def.getInitValNode() != null) {
+                    String v = emitExp(def.getInitValNode().getExpNodes().get(0), ctx);
+                    emit(IrInstruction.Opcode.STORE, Arrays.asList(v, alloca), "  store i32 " + v + ", i32* " + alloca + ", align 4");
+                }
+                VarInfo vi = new VarInfo();
+                vi.storage = Storage.LOCAL;
+                vi.isArray = false;
+                vi.ptr = alloca;
+                vi.dims = Collections.emptyList();
+                ctx.defineVar(name, vi);
+            } else {
+                String alloca = freshReg();
+                emit(IrInstruction.Opcode.ALLOCA, alloca, Collections.emptyList(), "  " + alloca + " = alloca [" + len + " x i32], align 4");
+                String base = freshReg();
+                emit(IrInstruction.Opcode.GEP, base, Arrays.asList(alloca), "  " + base + " = getelementptr inbounds [" + len + " x i32], [" + len + " x i32]* " + alloca + ", i32 0, i32 0");
+                VarInfo vi = new VarInfo();
+                vi.storage = Storage.LOCAL;
+                vi.isArray = true;
+                vi.ptr = base;
+                vi.dims = dims;
+                ctx.defineVar(name, vi);
+                if (def.getInitValNode() != null) {
+                    List<ExpNode> exps = def.getInitValNode().getExpNodes();
+                    for (int i = 0; i < Math.min(exps.size(), len); i++) {
+                        String val = emitExp(exps.get(i), ctx);
+                        String elemPtr = freshReg();
+                        emit(IrInstruction.Opcode.GEP, elemPtr, Arrays.asList(base), "  " + elemPtr + " = getelementptr inbounds i32, i32* " + base + ", i32 " + i);
+                        emit(IrInstruction.Opcode.STORE, Arrays.asList(val, elemPtr), "  store i32 " + val + ", i32* " + elemPtr + ", align 4");
                     }
                 }
             }
         }
+    }
     }
 
     private void emitStmt(StmtNode stmt, FuncContext ctx, String funcName) {
@@ -564,7 +642,7 @@ public class LlvmIRGenerator {
             }
             case LValAssignGetint: {
                 String call = freshReg();
-                funcsSb.append("  ").append(call).append(" = call i32 @getint()\n");
+                emit(IrInstruction.Opcode.CALL, call, Collections.emptyList(), "  " + call + " = call i32 @getint()");
                 emitStoreLVal(stmt.getLValNode(), call, ctx);
                 break;
             }
@@ -579,13 +657,15 @@ public class LlvmIRGenerator {
                 break;
             case Break:
                 if (!ctx.breakLabels.isEmpty()) {
-                    funcsSb.append("  br label %").append(ctx.breakLabels.peek()).append("\n");
+                    String target = ctx.breakLabels.peek();
+                    emit(IrInstruction.Opcode.BR, Collections.singletonList(target), "  br label %" + target);
                     ctx.terminated = true;
                 }
                 break;
             case Continue:
                 if (!ctx.contLabels.isEmpty()) {
-                    funcsSb.append("  br label %").append(ctx.contLabels.peek()).append("\n");
+                    String target = ctx.contLabels.peek();
+                    emit(IrInstruction.Opcode.BR, Collections.singletonList(target), "  br label %" + target);
                     ctx.terminated = true;
                 }
                 break;
@@ -600,10 +680,10 @@ public class LlvmIRGenerator {
     private void emitReturn(StmtNode stmt, FuncContext ctx, String funcName) {
         FuncSig sig = funcSigs.get(funcName);
         if (sig.ret == SymbolType.BaseType.VOID) {
-            funcsSb.append("  ret void\n");
+            emit(IrInstruction.Opcode.RET, null, Collections.emptyList(), "  ret void");
         } else {
             String v = stmt.getExpNode() == null ? "0" : emitExp(stmt.getExpNode(), ctx);
-            funcsSb.append("  ret i32 ").append(v).append("\n");
+            emit(IrInstruction.Opcode.RET, null, Collections.singletonList(v), "  ret i32 " + v);
         }
         ctx.terminated = true;
     }
@@ -613,14 +693,13 @@ public class LlvmIRGenerator {
         String elseLabel = stmt.getElseToken() != null ? freshLabel("if_else") : null;
         String endLabel = freshLabel("if_end");
         String cond = emitCondValue(stmt.getCondNode(), ctx);
-        funcsSb.append("  br i1 ").append(cond).append(", label %").append(thenLabel).append(", label %")
-                .append(elseLabel != null ? elseLabel : endLabel).append("\n");
+        emit(IrInstruction.Opcode.BR, Arrays.asList(cond, thenLabel, (elseLabel != null ? elseLabel : endLabel)), "  br i1 " + cond + ", label %" + thenLabel + ", label %" + (elseLabel != null ? elseLabel : endLabel));
         ctx.terminated = true;
 
         startBlock(thenLabel, ctx);
         emitStmt(stmt.getStmtNodes().get(0), ctx, funcName);
         if (!ctx.terminated) {
-            funcsSb.append("  br label %").append(endLabel).append("\n");
+            emit(IrInstruction.Opcode.BR, Collections.singletonList(endLabel), "  br label %" + endLabel);
             ctx.terminated = true;
         }
 
@@ -628,7 +707,7 @@ public class LlvmIRGenerator {
             startBlock(elseLabel, ctx);
             emitStmt(stmt.getStmtNodes().get(1), ctx, funcName);
             if (!ctx.terminated) {
-                funcsSb.append("  br label %").append(endLabel).append("\n");
+                emit(IrInstruction.Opcode.BR, Collections.singletonList(endLabel), "  br label %" + endLabel);
                 ctx.terminated = true;
             }
         }
@@ -641,13 +720,12 @@ public class LlvmIRGenerator {
         String bodyLabel = freshLabel("for_body");
         String contLabel = freshLabel("for_cont");
         String endLabel = freshLabel("for_end");
-        funcsSb.append("  br label %").append(loopLabel).append("\n");
+        emit(IrInstruction.Opcode.BR, Collections.singletonList(loopLabel), "  br label %" + loopLabel);
         ctx.terminated = true;
 
         startBlock(loopLabel, ctx);
         String cond = stmt.getCondNode() == null ? "1" : emitCondValue(stmt.getCondNode(), ctx);
-        funcsSb.append("  br i1 ").append(cond).append(", label %").append(bodyLabel)
-                .append(", label %").append(endLabel).append("\n");
+        emit(IrInstruction.Opcode.BR, Arrays.asList(cond, bodyLabel, endLabel), "  br i1 " + cond + ", label %" + bodyLabel + ", label %" + endLabel);
         ctx.terminated = true;
 
         startBlock(bodyLabel, ctx);
@@ -657,13 +735,13 @@ public class LlvmIRGenerator {
         ctx.breakLabels.pop();
         ctx.contLabels.pop();
         if (!ctx.terminated) {
-            funcsSb.append("  br label %").append(contLabel).append("\n");
+            emit(IrInstruction.Opcode.BR, Collections.singletonList(contLabel), "  br label %" + contLabel);
             ctx.terminated = true;
         }
 
         startBlock(contLabel, ctx);
         if (stmt.getForStmtNode2() != null) emitForAssign(stmt.getForStmtNode2(), ctx);
-        funcsSb.append("  br label %").append(loopLabel).append("\n");
+        emit(IrInstruction.Opcode.BR, Collections.singletonList(loopLabel), "  br label %" + loopLabel);
         ctx.terminated = true;
 
         startBlock(endLabel, ctx);
@@ -693,8 +771,8 @@ public class LlvmIRGenerator {
         for (int i = 0; i < ops.size(); i++) {
             String rhs = emitMulExp(terms.get(i + 1), ctx);
             String tmp = freshReg();
-            if (ops.get(i) == TokenType.PLUS) funcsSb.append("  ").append(tmp).append(" = add i32 ").append(res).append(", ").append(rhs).append("\n");
-            else funcsSb.append("  ").append(tmp).append(" = sub i32 ").append(res).append(", ").append(rhs).append("\n");
+            if (ops.get(i) == TokenType.PLUS) emit(IrInstruction.Opcode.ADD, tmp, Arrays.asList(res, rhs), "  " + tmp + " = add i32 " + res + ", " + rhs);
+            else emit(IrInstruction.Opcode.SUB, tmp, Arrays.asList(res, rhs), "  " + tmp + " = sub i32 " + res + ", " + rhs);
             res = tmp;
         }
         return res;
@@ -715,9 +793,9 @@ public class LlvmIRGenerator {
             String rhs = emitUnaryExp(factors.get(i + 1), ctx);
             String tmp = freshReg();
             switch (ops.get(i)) {
-                case MULT: funcsSb.append("  ").append(tmp).append(" = mul i32 ").append(res).append(", ").append(rhs).append("\n"); break;
-                case DIV: funcsSb.append("  ").append(tmp).append(" = sdiv i32 ").append(res).append(", ").append(rhs).append("\n"); break;
-                case MOD: funcsSb.append("  ").append(tmp).append(" = srem i32 ").append(res).append(", ").append(rhs).append("\n"); break;
+                case MULT: emit(IrInstruction.Opcode.MUL, tmp, Arrays.asList(res, rhs), "  " + tmp + " = mul i32 " + res + ", " + rhs); break;
+                case DIV: emit(IrInstruction.Opcode.SDIV, tmp, Arrays.asList(res, rhs), "  " + tmp + " = sdiv i32 " + res + ", " + rhs); break;
+                case MOD: emit(IrInstruction.Opcode.SREM, tmp, Arrays.asList(res, rhs), "  " + tmp + " = srem i32 " + res + ", " + rhs); break;
                 default: break;
             }
             res = tmp;
@@ -732,17 +810,18 @@ public class LlvmIRGenerator {
         TokenType tt = node.getUnaryOpNode().getToken().getTokenType();
         if (tt == TokenType.MINU) {
             String res = freshReg();
-            funcsSb.append("  ").append(res).append(" = sub i32 0, ").append(inner).append("\n");
+            emit(IrInstruction.Opcode.SUB, res, Arrays.asList("0", inner), "  " + res + " = sub i32 0, " + inner);
             return res;
         } else if (tt == TokenType.NOT) {
             String b = toBool(inner);
             String inv = freshReg();
-            funcsSb.append("  ").append(inv).append(" = xor i1 ").append(b).append(", true\n");
+            setRegType(inv, "i1");
+            emit(IrInstruction.Opcode.XOR, inv, Arrays.asList(b, "true"), "  " + inv + " = xor i1 " + b + ", true");
             boolRegs.add(inv);
             cmpRegs.add(inv);
             regType.put(inv, "i1");
             String res = freshReg();
-            funcsSb.append("  ").append(res).append(" = zext i1 ").append(inv).append(" to i32\n");
+            emit(IrInstruction.Opcode.ZEXT, res, Collections.singletonList(inv), "  " + res + " = zext i1 " + inv + " to i32");
             return res;
         }
         return inner;
@@ -753,13 +832,11 @@ public class LlvmIRGenerator {
         if (node.getLValNode() != null) {
             String addr = emitLValAddress(node.getLValNode(), ctx);
             String res = freshReg();
-            funcsSb.append("  ").append(res).append(" = load i32, i32* ").append(addr).append(", align 4\n");
+            emit(IrInstruction.Opcode.LOAD, res, Collections.singletonList(addr), "  " + res + " = load i32, i32* " + addr + ", align 4");
             return res;
         }
-        int val = Integer.parseInt(node.getNumberNode().getStr());
-        String res = freshReg();
-        funcsSb.append("  ").append(res).append(" = add i32 0, ").append(val).append("\n");
-        return res;
+        // 数字字面量直接作为常量返回，避免多余指令
+        return node.getNumberNode().getStr();
     }
 
     private String emitCall(UnaryExpNode node, FuncContext ctx) {
@@ -781,18 +858,17 @@ public class LlvmIRGenerator {
         FuncSig sig = funcSigs.get(funcName);
         String retType = sig == null ? "i32" : irRet(sig.ret);
         String res = null;
-        if (!"void".equals(retType)) {
-            res = freshReg();
-            funcsSb.append("  ").append(res).append(" = call ").append(retType).append(" @").append(funcName).append("(");
-        } else {
-            funcsSb.append("  call void @").append(funcName).append("(");
-        }
         List<String> parts = new ArrayList<>();
         for (int i = 0; i < argVals.size(); i++) parts.add(argTypes.get(i) + " " + argVals.get(i));
-        funcsSb.append(String.join(", ", parts)).append(")\n");
+        if (!"void".equals(retType)) {
+            res = freshReg();
+            emit(IrInstruction.Opcode.CALL, res, argVals, "  " + res + " = call " + retType + " @" + funcName + "(" + String.join(", ", parts) + ")");
+        } else {
+            emit(IrInstruction.Opcode.CALL, argVals, "  call void @" + funcName + "(" + String.join(", ", parts) + ")");
+        }
         if (res == null) {
             String zero = freshReg();
-            funcsSb.append("  ").append(zero).append(" = add i32 0, 0\n");
+            emit(IrInstruction.Opcode.ADD, zero, Arrays.asList("0", "0"), "  " + zero + " = add i32 0, 0");
             return zero;
         }
         return res;
@@ -804,23 +880,24 @@ public class LlvmIRGenerator {
     private String emitLOrValue(LOrExpNode node, FuncContext ctx) {
         if (node.getOrToken() == null) return emitLAndValue(node.getLAndExpNode(), ctx);
         String resPtr = freshReg();
-        funcsSb.append("  ").append(resPtr).append(" = alloca i1\n");
+        emit(IrInstruction.Opcode.ALLOCA, resPtr, Collections.emptyList(), "  " + resPtr + " = alloca i1");
         String lhs = emitLAndValue(node.getLAndExpNode(), ctx);
-        funcsSb.append("  store i1 ").append(lhs).append(", i1* ").append(resPtr).append("\n");
+        emit(IrInstruction.Opcode.STORE, Arrays.asList(lhs, resPtr), "  store i1 " + lhs + ", i1* " + resPtr);
         String rhsLabel = freshLabel("lor_rhs");
         String endLabel = freshLabel("lor_end");
-        funcsSb.append("  br i1 ").append(lhs).append(", label %").append(endLabel).append(", label %").append(rhsLabel).append("\n");
+        emit(IrInstruction.Opcode.BR, Arrays.asList(lhs, endLabel, rhsLabel), "  br i1 " + lhs + ", label %" + endLabel + ", label %" + rhsLabel);
         ctx.terminated = true;
 
         startBlock(rhsLabel, ctx);
         String rhs = emitLOrValue(node.getLOrExpNode(), ctx);
-        funcsSb.append("  store i1 ").append(rhs).append(", i1* ").append(resPtr).append("\n");
-        funcsSb.append("  br label %").append(endLabel).append("\n");
+        emit(IrInstruction.Opcode.STORE, Arrays.asList(rhs, resPtr), "  store i1 " + rhs + ", i1* " + resPtr);
+        emit(IrInstruction.Opcode.BR, Collections.singletonList(endLabel), "  br label %" + endLabel);
         ctx.terminated = true;
 
         startBlock(endLabel, ctx);
         String res = freshReg();
-        funcsSb.append("  ").append(res).append(" = load i1, i1* ").append(resPtr).append("\n");
+        setRegType(res, "i1");
+        emit(IrInstruction.Opcode.LOAD, res, Collections.singletonList(resPtr), "  " + res + " = load i1, i1* " + resPtr);
         boolRegs.add(res);
         return res;
     }
@@ -828,23 +905,24 @@ public class LlvmIRGenerator {
     private String emitLAndValue(LAndExpNode node, FuncContext ctx) {
         if (node.getAndToken() == null) return emitEqValue(node.getEqExpNode(), ctx);
         String resPtr = freshReg();
-        funcsSb.append("  ").append(resPtr).append(" = alloca i1\n");
+        emit(IrInstruction.Opcode.ALLOCA, resPtr, Collections.emptyList(), "  " + resPtr + " = alloca i1");
         String lhs = emitEqValue(node.getEqExpNode(), ctx);
-        funcsSb.append("  store i1 ").append(lhs).append(", i1* ").append(resPtr).append("\n");
+        emit(IrInstruction.Opcode.STORE, Arrays.asList(lhs, resPtr), "  store i1 " + lhs + ", i1* " + resPtr);
         String rhsLabel = freshLabel("land_rhs");
         String endLabel = freshLabel("land_end");
-        funcsSb.append("  br i1 ").append(lhs).append(", label %").append(rhsLabel).append(", label %").append(endLabel).append("\n");
+        emit(IrInstruction.Opcode.BR, Arrays.asList(lhs, rhsLabel, endLabel), "  br i1 " + lhs + ", label %" + rhsLabel + ", label %" + endLabel);
         ctx.terminated = true;
 
         startBlock(rhsLabel, ctx);
         String rhs = emitLAndValue(node.getLAndExpNode(), ctx);
-        funcsSb.append("  store i1 ").append(rhs).append(", i1* ").append(resPtr).append("\n");
-        funcsSb.append("  br label %").append(endLabel).append("\n");
+        emit(IrInstruction.Opcode.STORE, Arrays.asList(rhs, resPtr), "  store i1 " + rhs + ", i1* " + resPtr);
+        emit(IrInstruction.Opcode.BR, Collections.singletonList(endLabel), "  br label %" + endLabel);
         ctx.terminated = true;
 
         startBlock(endLabel, ctx);
         String res = freshReg();
-        funcsSb.append("  ").append(res).append(" = load i1, i1* ").append(resPtr).append("\n");
+        setRegType(res, "i1");
+        emit(IrInstruction.Opcode.LOAD, res, Collections.singletonList(resPtr), "  " + res + " = load i1, i1* " + resPtr);
         boolRegs.add(res);
         return res;
     }
@@ -881,8 +959,9 @@ public class LlvmIRGenerator {
             }
             String cmp = freshReg();
             String cmpTy = "i32".equals(lType) ? "i32" : "i1";
-            if (ops.get(i) == TokenType.EQL) funcsSb.append("  ").append(cmp).append(" = icmp eq ").append(cmpTy).append(" ").append(lhsVal).append(", ").append(rhsVal).append("\n");
-            else funcsSb.append("  ").append(cmp).append(" = icmp ne ").append(cmpTy).append(" ").append(lhsVal).append(", ").append(rhsVal).append("\n");
+            setRegType(cmp, "i1");
+            if (ops.get(i) == TokenType.EQL) emit(IrInstruction.Opcode.ICMP, cmp, Arrays.asList(lhsVal, rhsVal), "  " + cmp + " = icmp eq " + cmpTy + " " + lhsVal + ", " + rhsVal);
+            else emit(IrInstruction.Opcode.ICMP, cmp, Arrays.asList(lhsVal, rhsVal), "  " + cmp + " = icmp ne " + cmpTy + " " + lhsVal + ", " + rhsVal);
             boolRegs.add(cmp);
             cmpRegs.add(cmp);
             regType.put(cmp, "i1");
@@ -905,12 +984,13 @@ public class LlvmIRGenerator {
         for (int i = 0; i < ops.size(); i++) {
             String rhs = emitAddExp(terms.get(i + 1), ctx);
             String cmp = freshReg();
+            setRegType(cmp, "i1");
             switch (ops.get(i)) {
-                case LSS: funcsSb.append("  ").append(cmp).append(" = icmp slt i32 ").append(res).append(", ").append(rhs).append("\n"); break;
-                case GRE: funcsSb.append("  ").append(cmp).append(" = icmp sgt i32 ").append(res).append(", ").append(rhs).append("\n"); break;
-                case LEQ: funcsSb.append("  ").append(cmp).append(" = icmp sle i32 ").append(res).append(", ").append(rhs).append("\n"); break;
-                case GEQ: funcsSb.append("  ").append(cmp).append(" = icmp sge i32 ").append(res).append(", ").append(rhs).append("\n"); break;
-                default: break;
+                case LSS: emit(IrInstruction.Opcode.ICMP, cmp, Arrays.asList(res, rhs), "  " + cmp + " = icmp slt i32 " + res + ", " + rhs); break;
+                case GRE: emit(IrInstruction.Opcode.ICMP, cmp, Arrays.asList(res, rhs), "  " + cmp + " = icmp sgt i32 " + res + ", " + rhs); break;
+                case LEQ: emit(IrInstruction.Opcode.ICMP, cmp, Arrays.asList(res, rhs), "  " + cmp + " = icmp sle i32 " + res + ", " + rhs); break;
+                case GEQ: emit(IrInstruction.Opcode.ICMP, cmp, Arrays.asList(res, rhs), "  " + cmp + " = icmp sge i32 " + res + ", " + rhs); break;
+            default: break;
             }
             boolRegs.add(cmp);
             cmpRegs.add(cmp);
@@ -919,7 +999,7 @@ public class LlvmIRGenerator {
         }
         if (boolRegs.contains(res)) {
             String z = freshReg();
-            funcsSb.append("  ").append(z).append(" = zext i1 ").append(res).append(" to i32\n");
+            emit(IrInstruction.Opcode.ZEXT, z, Collections.singletonList(res), "  " + z + " = zext i1 " + res + " to i32");
             return z;
         }
         return res;
@@ -928,7 +1008,8 @@ public class LlvmIRGenerator {
     private String toBool(String v) {
         if (boolRegs.contains(v)) return v;
         String res = freshReg();
-        funcsSb.append("  ").append(res).append(" = icmp ne i32 ").append(v).append(", 0\n");
+        setRegType(res, "i1");
+        emit(IrInstruction.Opcode.ICMP, res, Arrays.asList(v, "0"), "  " + res + " = icmp ne i32 " + v + ", 0");
         boolRegs.add(res);
         cmpRegs.add(res);
         regType.put(res, "i1");
@@ -939,7 +1020,7 @@ public class LlvmIRGenerator {
     private String ensureI32(String v) {
         if (!boolRegs.contains(v) && !cmpRegs.contains(v) && !"i1".equals(regType.get(v))) return v;
         String z = freshReg();
-        funcsSb.append("  ").append(z).append(" = zext i1 ").append(v).append(" to i32\n");
+        emit(IrInstruction.Opcode.ZEXT, z, Collections.singletonList(v), "  " + z + " = zext i1 " + v + " to i32");
         return z;
     }
 
@@ -956,7 +1037,7 @@ public class LlvmIRGenerator {
     /* ---------- LVal ---------- */
     private void emitStoreLVal(LValNode lValNode, String value, FuncContext ctx) {
         String addr = emitLValAddress(lValNode, ctx);
-        funcsSb.append("  store i32 ").append(value).append(", i32* ").append(addr).append(", align 4\n");
+        emit(IrInstruction.Opcode.STORE, Arrays.asList(value, addr), "  store i32 " + value + ", i32* " + addr + ", align 4");
     }
 
     private String emitLValAddress(LValNode lValNode, FuncContext ctx) {
@@ -968,26 +1049,24 @@ public class LlvmIRGenerator {
                 if (!vi.isArray || lValNode.getExpNodes().isEmpty()) {
                     String base = freshReg();
                     if (vi.isArray) {
-                        funcsSb.append("  ").append(base).append(" = getelementptr inbounds [").append(vi.dims.get(0)).append(" x i32], [")
-                                .append(vi.dims.get(0)).append(" x i32]* @").append(vi.label).append(", i32 0, i32 0\n");
+                        emit(IrInstruction.Opcode.GEP, base, Collections.singletonList("@" + vi.label), "  " + base + " = getelementptr inbounds [" + vi.dims.get(0) + " x i32], [" + vi.dims.get(0) + " x i32]* @" + vi.label + ", i32 0, i32 0");
                     } else {
-                        funcsSb.append("  ").append(base).append(" = getelementptr inbounds i32, i32* @").append(vi.label).append(", i32 0\n");
+                        emit(IrInstruction.Opcode.GEP, base, Collections.singletonList("@" + vi.label), "  " + base + " = getelementptr inbounds i32, i32* @" + vi.label + ", i32 0");
                     }
                     return base;
                 } else {
                     String base = freshReg();
-                    funcsSb.append("  ").append(base).append(" = getelementptr inbounds [").append(vi.dims.get(0)).append(" x i32], [")
-                            .append(vi.dims.get(0)).append(" x i32]* @").append(vi.label).append(", i32 0, i32 0\n");
+                    emit(IrInstruction.Opcode.GEP, base, Collections.singletonList("@" + vi.label), "  " + base + " = getelementptr inbounds [" + vi.dims.get(0) + " x i32], [" + vi.dims.get(0) + " x i32]* @" + vi.label + ", i32 0, i32 0");
                     String offset = computeOffset(lValNode.getExpNodes(), vi.dims, ctx);
                     String addr = freshReg();
-                    funcsSb.append("  ").append(addr).append(" = getelementptr inbounds i32, i32* ").append(base).append(", i32 ").append(offset).append("\n");
+                    emit(IrInstruction.Opcode.GEP, addr, Arrays.asList(base, offset), "  " + addr + " = getelementptr inbounds i32, i32* " + base + ", i32 " + offset);
                     return addr;
                 }
             }
             if (!vi.isArray || lValNode.getExpNodes().isEmpty()) {
                 if (vi.storage == Storage.PARAM && vi.isArray) {
                     String base = freshReg();
-                    funcsSb.append("  ").append(base).append(" = load i32*, i32** ").append(vi.ptr).append(", align 4\n");
+                    emit(IrInstruction.Opcode.LOAD, base, Collections.singletonList(vi.ptr), "  " + base + " = load i32*, i32** " + vi.ptr + ", align 4");
                     return base;
                 }
                 return vi.ptr;
@@ -995,13 +1074,13 @@ public class LlvmIRGenerator {
             String base;
             if (vi.storage == Storage.PARAM && vi.isArray) {
                 base = freshReg();
-                funcsSb.append("  ").append(base).append(" = load i32*, i32** ").append(vi.ptr).append(", align 4\n");
+                emit(IrInstruction.Opcode.LOAD, base, Collections.singletonList(vi.ptr), "  " + base + " = load i32*, i32** " + vi.ptr + ", align 4");
             } else {
                 base = vi.ptr;
             }
             String offset = computeOffset(lValNode.getExpNodes(), vi.dims, ctx);
             String addr = freshReg();
-            funcsSb.append("  ").append(addr).append(" = getelementptr inbounds i32, i32* ").append(base).append(", i32 ").append(offset).append("\n");
+            emit(IrInstruction.Opcode.GEP, addr, Arrays.asList(base, offset), "  " + addr + " = getelementptr inbounds i32, i32* " + base + ", i32 " + offset);
             return addr;
         }
         GlobalVar gv = globals.get(name);
@@ -1009,24 +1088,22 @@ public class LlvmIRGenerator {
             if (!gv.isArray || lValNode.getExpNodes().isEmpty()) {
                 String base = freshReg();
                 if (gv.isArray) {
-                    funcsSb.append("  ").append(base).append(" = getelementptr inbounds [").append(gv.len).append(" x i32], [")
-                            .append(gv.len).append(" x i32]* @").append(gv.name).append(", i32 0, i32 0\n");
+                    emit(IrInstruction.Opcode.GEP, base, Collections.singletonList("@" + gv.name), "  " + base + " = getelementptr inbounds [" + gv.len + " x i32], [" + gv.len + " x i32]* @" + gv.name + ", i32 0, i32 0");
                 } else {
-                    funcsSb.append("  ").append(base).append(" = getelementptr inbounds i32, i32* @").append(gv.name).append(", i32 0\n");
+                    emit(IrInstruction.Opcode.GEP, base, Collections.singletonList("@" + gv.name), "  " + base + " = getelementptr inbounds i32, i32* @" + gv.name + ", i32 0");
                 }
                 return base;
             } else {
                 String base = freshReg();
-                funcsSb.append("  ").append(base).append(" = getelementptr inbounds [").append(gv.len).append(" x i32], [")
-                        .append(gv.len).append(" x i32]* @").append(gv.name).append(", i32 0, i32 0\n");
+                emit(IrInstruction.Opcode.GEP, base, Collections.singletonList("@" + gv.name), "  " + base + " = getelementptr inbounds [" + gv.len + " x i32], [" + gv.len + " x i32]* @" + gv.name + ", i32 0, i32 0");
                 String offset = computeOffset(lValNode.getExpNodes(), gv.dims, ctx);
                 String addr = freshReg();
-                funcsSb.append("  ").append(addr).append(" = getelementptr inbounds i32, i32* ").append(base).append(", i32 ").append(offset).append("\n");
+                emit(IrInstruction.Opcode.GEP, addr, Arrays.asList(base, offset), "  " + addr + " = getelementptr inbounds i32, i32* " + base + ", i32 " + offset);
                 return addr;
             }
         }
         String dummy = freshReg();
-        funcsSb.append("  ").append(dummy).append(" = alloca i32\n");
+        emit(IrInstruction.Opcode.ALLOCA, dummy, Collections.emptyList(), "  " + dummy + " = alloca i32");
         return dummy;
     }
 
@@ -1042,12 +1119,12 @@ public class LlvmIRGenerator {
             String term;
             if (stride != 1) {
                 term = freshReg();
-                funcsSb.append("  ").append(term).append(" = mul i32 ").append(idx).append(", ").append(stride).append("\n");
+                emit(IrInstruction.Opcode.MUL, term, Arrays.asList(idx, String.valueOf(stride)), "  " + term + " = mul i32 " + idx + ", " + stride);
             } else term = idx;
             if (offset == null) offset = term;
             else {
                 String sum = freshReg();
-                funcsSb.append("  ").append(sum).append(" = add i32 ").append(offset).append(", ").append(term).append("\n");
+                emit(IrInstruction.Opcode.ADD, sum, Arrays.asList(offset, term), "  " + sum + " = add i32 " + offset + ", " + term);
                 offset = sum;
             }
         }
@@ -1087,15 +1164,14 @@ public class LlvmIRGenerator {
             if ("%d".equals(seg)) {
                 if (argIdx < argVals.size()) {
                     String v = argVals.get(argIdx++);
-                    funcsSb.append("  call void @putint(i32 ").append(v).append(")\n");
+                    emit(IrInstruction.Opcode.CALL, Collections.singletonList(v), "  call void @putint(i32 " + v + ")");
                 }
             } else if (!seg.isEmpty()) {
                 String label = newStringConst(seg);
                 int len = getStringLen(seg);
                 String ptr = freshReg();
-                funcsSb.append("  ").append(ptr).append(" = getelementptr inbounds [").append(len).append(" x i8], [")
-                        .append(len).append(" x i8]* ").append(label).append(", i32 0, i32 0\n");
-                funcsSb.append("  call void @putstr(i8* ").append(ptr).append(")\n");
+                emit(IrInstruction.Opcode.GEP, ptr, Collections.singletonList(label), "  " + ptr + " = getelementptr inbounds [" + len + " x i8], [" + len + " x i8]* " + label + ", i32 0, i32 0");
+                emit(IrInstruction.Opcode.CALL, Collections.singletonList(ptr), "  call void @putstr(i8* " + ptr + ")");
             }
         }
     }
@@ -1106,7 +1182,7 @@ public class LlvmIRGenerator {
         }
         String label = ".str_" + (strId++);
         int len = getStringLen(content);
-        String def = "@" + label + " = private unnamed_addr constant [" + len + " x i8] c\"" + escapeString(content) + "\", align 1\n";
+        String def = "@" + label + " = private unnamed_addr constant [" + len + " x i8] c\"" + escapeString(content) + "\", align 1";
         stringLiterals.put(label, def);
         strContentMap.put(content, "@" + label);
         return "@" + label;
@@ -1152,8 +1228,7 @@ public class LlvmIRGenerator {
             GlobalVar gv = globals.get(lVal.getIdent().getValue());
             if (gv != null && gv.isArray) {
                 String base = freshReg();
-                funcsSb.append("  ").append(base).append(" = getelementptr inbounds [").append(gv.len).append(" x i32], [")
-                        .append(gv.len).append(" x i32]* @").append(gv.name).append(", i32 0, i32 0\n");
+                emit(IrInstruction.Opcode.GEP, base, Collections.singletonList("@" + gv.name), "  " + base + " = getelementptr inbounds [" + gv.len + " x i32], [" + gv.len + " x i32]* @" + gv.name + ", i32 0, i32 0");
                 return base;
             }
             return null;
@@ -1161,9 +1236,36 @@ public class LlvmIRGenerator {
         if (!vi.isArray) return null;
         if (vi.storage == Storage.PARAM && vi.isArray) {
             String base = freshReg();
-            funcsSb.append("  ").append(base).append(" = load i32*, i32** ").append(vi.ptr).append(", align 4\n");
+            emit(IrInstruction.Opcode.LOAD, base, Collections.singletonList(vi.ptr), "  " + base + " = load i32*, i32** " + vi.ptr + ", align 4");
             return base;
         }
         return vi.ptr;
+    }
+
+    private void buildCFG(IrFunction function) {
+        for (IrBasicBlock block : function.getBlocks()) {
+            for (IrInstruction insn : block.getInstructions()) {
+                if (insn.getOpcode() != IrInstruction.Opcode.BR) continue;
+                List<IrValue> ops = insn.getOperands();
+                if (ops.isEmpty()) continue;
+                if (ops.size() == 1 && ops.get(0) instanceof IrLabel) {
+                    linkBlocks(block, (IrLabel) ops.get(0), function);
+                } else if (ops.size() >= 2) {
+                    IrValue op1 = ops.get(ops.size() - 2);
+                    IrValue op2 = ops.get(ops.size() - 1);
+                    if (op1 instanceof IrLabel) linkBlocks(block, (IrLabel) op1, function);
+                    if (op2 instanceof IrLabel) linkBlocks(block, (IrLabel) op2, function);
+                }
+            }
+        }
+    }
+
+    private void linkBlocks(IrBasicBlock from, IrLabel targetLabel, IrFunction function) {
+        IrBasicBlock target = function.getBlock(targetLabel.getName());
+        if (target == null) {
+            return;
+        }
+        from.addSucc(target);
+        target.addPred(from);
     }
 }
